@@ -1,0 +1,51 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/Grid
+      Enabled: true
+      Name: Grid
+      Reference Frame: base_link
+    - Class: rviz/RobotModel
+      Enabled: true
+      Name: RobotModel
+      Robot Description: robot_description
+    - Class: rviz/LaserScan
+      Enabled: true
+      Name: Laser
+      Topic: /scan
+      Size (m): 0.03
+      Color: 0; 255; 0
+    - Class: rviz/Path
+      Enabled: true
+      Name: LocalPath
+      Topic: /planner/local_path
+      Color: 255; 85; 0
+    - Class: rviz/Map
+      Enabled: false
+      Name: Map
+      Topic: /map
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: base_link
+  Name: root
+  Tools:
+    - Class: rviz/MoveCamera
+    - Class: rviz/Interact
+    - Class: rviz/Select
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 15
+      Focal Point: 0; 0; 0
+      Name: Orbit
+      Pitch: 0.65
+      Yaw: 1.4
+Window Geometry:
+  Height: 900
+  Width: 1400

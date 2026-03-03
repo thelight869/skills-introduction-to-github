@@ -1,0 +1,11 @@
+<launch>
+  <arg name="vocab_file" default="$(find orb_slam2_ros)/orb_slam2/Vocabulary/ORBvoc.txt"/>
+  <arg name="camera_settings" default="$(find mars_rover_sim)/config/orbslam_mono.yaml"/>
+
+  <node pkg="orb_slam2_ros" type="mono" name="orbslam_mono" output="screen">
+    <param name="voc_file" value="$(arg vocab_file)"/>
+    <param name="settings_file" value="$(arg camera_settings)"/>
+    <remap from="/camera/image_raw" to="/rgb/image_raw"/>
+    <remap from="/imu" to="/imu/data"/>
+  </node>
+</launch>
