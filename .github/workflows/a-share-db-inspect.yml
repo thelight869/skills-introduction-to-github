@@ -1,4 +1,4 @@
-name: A-share DB inspect
+name: A-share probability research
 
 on:
   push:
@@ -12,29 +12,49 @@ permissions:
 env:
   DB_URL: https://github.com/noblechang/a-share-data/releases/download/FREE_DATA_v0/ashare_pit.duckdb
   DB_SHA256: 95601e2f1f5b62595a80e735a52da3a64c7446ebe7f8c984e3394b96f90e4778
+  PYTHONUNBUFFERED: '1'
 
 jobs:
-  inspect:
+  research:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install dependencies
-        run: python -m pip install --upgrade pip duckdb
-      - name: Download and verify public database
+      - name: Install analysis dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install duckdb numpy pandas pyarrow
+      - name: Reassemble and verify research program
+        run: |
+          set -euxo pipefail
+          : > research/run_a_share_research.py
+          for f in research/run_a_share_research.part00.b64 research/run_a_share_research.part01.b64 research/run_a_share_research.part02.b64 research/run_a_share_research.part03.b64; do
+            base64 -d "$f" >> research/run_a_share_research.py
+          done
+          python -m py_compile research/run_a_share_research.py
+          wc -l -c research/run_a_share_research.py
+          sha256sum research/run_a_share_research.py
+      - name: Download and verify public A-share database
         run: |
           set -euxo pipefail
           curl -L --fail --retry 8 --retry-delay 10 --continue-at - "$DB_URL" -o ashare_pit.duckdb
           echo "$DB_SHA256  ashare_pit.duckdb" | sha256sum -c -
           ls -lh ashare_pit.duckdb
-      - name: Inspect schema and samples
-        run: python research/inspect_db.py
-      - name: Upload inspection results
+          free -h
+          df -h .
+      - name: Run full 2016-2026 eight-indicator research
+        run: |
+          mkdir -p output work
+          python research/run_a_share_research.py
+          find output -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+      - name: Upload research outputs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ashare-db-inspection
+          name: a-share-probability-research
           path: output/
+          if-no-files-found: warn
           retention-days: 7
