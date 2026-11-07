@@ -47,9 +47,12 @@ jobs:
           df -h .
       - name: Run full 2016-2026 eight-indicator research
         run: |
-          mkdir -p output work
-          python research/run_a_share_research.py
-          find output -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+          set -o pipefail
+          mkdir -p output work/duckdb_tmp
+          python research/run_a_share_research.py 2>&1 | tee output/run.log
+          status=${PIPESTATUS[0]}
+          find output -maxdepth 1 -type f -printf '%f %s bytes\n' | sort | tee -a output/run.log
+          exit $status
       - name: Upload research outputs
         if: always()
         uses: actions/upload-artifact@v4
