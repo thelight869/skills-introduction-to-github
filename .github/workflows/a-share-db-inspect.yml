@@ -42,11 +42,20 @@ jobs:
           from pathlib import Path
           path = Path('research/run_a_share_research.py')
           text = path.read_text(encoding='utf-8')
-          old = 'con.execute(query).fetch_record_batch(rows_per_batch=200_000)'
-          new = 'con.sql(query).to_arrow_reader(batch_size=200_000)'
-          if old not in text:
-              raise SystemExit('Expected DuckDB 1.x streaming call not found')
-          path.write_text(text.replace(old, new), encoding='utf-8')
+          replacements = {
+              'con.execute(query).fetch_record_batch(rows_per_batch=200_000)': 'con.sql(query).to_arrow_reader(batch_size=200_000)',
+              '    con.execute(f"CREATE VIEW samples AS SELECT * FROM read_parquet(\'{sample_path.as_posix()}\')")': '''    con.close()
+    con = duckdb.connect()
+    con.execute("PRAGMA threads=4")
+    con.execute("PRAGMA memory_limit=\'5GB\'")
+    con.execute(f"PRAGMA temp_directory=\'{WORK_DIR.as_posix()}/duckdb_tmp\'")
+    con.execute(f"CREATE VIEW samples AS SELECT * FROM read_parquet(\'{sample_path.as_posix()}\')")''',
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'Expected code fragment not found: {old}')
+              text = text.replace(old, new)
+          path.write_text(text, encoding='utf-8')
           PY
           python -m py_compile research/run_a_share_research.py
           wc -l -c research/run_a_share_research.py
