@@ -38,7 +38,7 @@ jobs:
         run: |
           set -euxo pipefail
           : > research/run_a_share_research.py
-          for f in research/run_a_share_research.part00.b64 research/run_a_share_research.part01.b64 research/run_a_share_research.part02.b64 research/run_a_share_research.part03.b64; do
+          for f in research/update20261106/run.part00.b64 research/update20261106/run.part01.b64 research/update20261106/run.part02.b64 research/update20261106/run.part03.b64; do
             base64 -d "$f" >> research/run_a_share_research.py
           done
           python - <<'PY'
