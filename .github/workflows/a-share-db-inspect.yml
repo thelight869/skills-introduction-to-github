@@ -34,7 +34,7 @@ jobs:
           print('DuckDB', duckdb.__version__)
           print('BaoStock package', getattr(baostock, '__version__', 'unknown'))
           PY
-      - name: Reassemble and verify research program
+      - name: Reassemble and verify research programs
         run: |
           set -euxo pipefail
           : > research/run_a_share_research.py
@@ -43,6 +43,7 @@ jobs:
           done
           python - <<'PY'
           from pathlib import Path
+
           path = Path('research/run_a_share_research.py')
           text = path.read_text(encoding='utf-8')
           old_stream = 'con.execute(query).fetch_record_batch(rows_per_batch=200_000)'
@@ -58,9 +59,30 @@ jobs:
           ])
           for old, new in [(old_stream, new_stream), (old_view, new_view)]:
               if old not in text:
-                  raise SystemExit(f'Expected code fragment not found: {old}')
+                  raise SystemExit(f'Expected research code fragment not found: {old}')
               text = text.replace(old, new)
           path.write_text(text, encoding='utf-8')
+
+          fetch_path = Path('research/fetch_baostock_incremental.py')
+          fetch = fetch_path.read_text(encoding='utf-8')
+          end_line = 'END_DATE = os.environ.get("INCREMENTAL_END", "2026-11-06")\n'
+          shard_block = end_line + 'SHARD_COUNT = int(os.environ.get("SHARD_COUNT", "1"))\nSHARD_INDEX = int(os.environ.get("SHARD_INDEX", "0"))\n'
+          if end_line not in fetch:
+              raise SystemExit('END_DATE anchor not found')
+          fetch = fetch.replace(end_line, shard_block, 1)
+          candidate_anchor = '        log(\n            f"Incremental candidates='
+          candidate_insert = '        all_candidate_count = len(candidates)\n        candidates = candidates[SHARD_INDEX::SHARD_COUNT]\n\n' + candidate_anchor
+          if candidate_anchor not in fetch:
+              raise SystemExit('Candidate anchor not found')
+          fetch = fetch.replace(candidate_anchor, candidate_insert, 1)
+          metadata_anchor = '                "new_current_a_share_count": len(new_current),\n'
+          metadata_insert = metadata_anchor + '                "all_candidate_queries": all_candidate_count,\n                "shard_count": SHARD_COUNT,\n                "shard_index": SHARD_INDEX,\n'
+          if metadata_anchor not in fetch:
+              raise SystemExit('Metadata anchor not found')
+          fetch = fetch.replace(metadata_anchor, metadata_insert, 1)
+          fetch = fetch.replace('if summary["last_date"] != END_DATE:', 'if str(summary["last_date"])[:10] != END_DATE:', 1)
+          fetch = fetch.replace('if int(summary["traded_on_end"]) < 5000:', 'if SHARD_COUNT == 1 and int(summary["traded_on_end"]) < 5000:', 1)
+          fetch_path.write_text(fetch, encoding='utf-8')
           PY
           python -m py_compile research/run_a_share_research.py
           python -m py_compile research/fetch_baostock_incremental.py
@@ -73,19 +95,107 @@ jobs:
           ls -lh ashare_pit.duckdb
           free -h
           df -h .
-      - name: Fetch BaoStock increment through 2026-11-06
+      - name: Fetch BaoStock increment in four independent shards
         run: |
-          set -o pipefail
+          set +e
           mkdir -p incremental output work/duckdb_tmp
-          python research/fetch_baostock_incremental.py 2>&1 | tee incremental/fetch.log
-          status=${PIPESTATUS[0]}
-          cp incremental/incremental_meta.json output/ 2>/dev/null || true
-          cp incremental/trade_dates.csv output/ 2>/dev/null || true
-          cp incremental/stock_basic_current.csv output/ 2>/dev/null || true
-          cp incremental/new_security_master.csv output/ 2>/dev/null || true
-          cp incremental/query_failures.csv output/ 2>/dev/null || true
-          cp incremental/fetch.log output/incremental_fetch.log
-          exit $status
+          pids=()
+          for i in 0 1 2 3; do
+            mkdir -p "incremental/shard${i}"
+            SHARD_COUNT=4 SHARD_INDEX="$i" INCREMENTAL_DIR="incremental/shard${i}" \
+              python research/fetch_baostock_incremental.py > "incremental/shard${i}/fetch.log" 2>&1 &
+            pids+=("$!")
+          done
+          status=0
+          for i in 0 1 2 3; do
+            wait "${pids[$i]}"
+            rc=$?
+            echo "shard $i exit code $rc"
+            if [ "$rc" -ne 0 ]; then status=1; fi
+          done
+          for i in 0 1 2 3; do
+            echo "===== SHARD $i =====" | tee -a output/incremental_fetch.log
+            cat "incremental/shard${i}/fetch.log" | tee -a output/incremental_fetch.log
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "At least one BaoStock shard failed" | tee -a output/incremental_fetch.log
+            exit 1
+          fi
+          python - <<'PY'
+          import glob
+          import json
+          from pathlib import Path
+          import duckdb
+          import pandas as pd
+
+          shard_dirs = [Path(f'incremental/shard{i}') for i in range(4)]
+          metas = [json.loads((d/'incremental_meta.json').read_text(encoding='utf-8')) for d in shard_dirs]
+          con = duckdb.connect()
+          con.execute("""
+              COPY (
+                  SELECT * FROM read_parquet('incremental/shard*/incremental_bars.parquet')
+              ) TO 'incremental/incremental_bars.parquet'
+              (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 100000)
+          """)
+          row = con.execute("""
+              SELECT COUNT(*)::BIGINT AS rows,
+                     COUNT(DISTINCT security_id)::BIGINT AS securities,
+                     COUNT(DISTINCT trade_date)::BIGINT AS trading_dates,
+                     MIN(trade_date) AS first_date,
+                     MAX(trade_date) AS last_date,
+                     COUNT(DISTINCT CASE WHEN trade_date=DATE '2026-11-06' AND tradestatus=1 AND volume>0 THEN security_id END)::BIGINT AS traded_on_end,
+                     COUNT(*) - COUNT(DISTINCT security_id || '|' || CAST(trade_date AS VARCHAR)) AS duplicate_keys
+              FROM read_parquet('incremental/incremental_bars.parquet')
+          """).fetchdf().iloc[0].to_dict()
+          con.close()
+          summary = {
+              'rows': int(row['rows']),
+              'securities': int(row['securities']),
+              'trading_dates': int(row['trading_dates']),
+              'first_date': str(row['first_date'])[:10],
+              'last_date': str(row['last_date'])[:10],
+              'traded_on_end': int(row['traded_on_end']),
+              'duplicate_keys': int(row['duplicate_keys']),
+              'requested_start': '2026-09-25',
+              'requested_end': '2026-11-06',
+              'candidate_queries': sum(int(m['candidate_queries']) for m in metas),
+              'successful_queries': sum(int(m['successful_queries']) for m in metas),
+              'empty_queries': sum(int(m['empty_queries']) for m in metas),
+              'persistent_failures': sum(int(m['persistent_failures']) for m in metas),
+              'baseline_security_count': int(metas[0]['baseline_security_count']),
+              'new_current_a_share_count': int(metas[0]['new_current_a_share_count']),
+              'shards': 4,
+          }
+          if summary['last_date'] != '2026-11-06':
+              raise SystemExit(f"Incremental data is stale: {summary['last_date']}")
+          if summary['traded_on_end'] < 5000:
+              raise SystemExit(f"Low end-date market coverage: {summary['traded_on_end']}")
+          if summary['persistent_failures'] != 0:
+              raise SystemExit(f"Persistent failures: {summary['persistent_failures']}")
+          if summary['duplicate_keys'] != 0:
+              raise SystemExit(f"Duplicate incremental keys: {summary['duplicate_keys']}")
+
+          failures = []
+          for d in shard_dirs:
+              p = d/'query_failures.csv'
+              try:
+                  frame = pd.read_csv(p)
+                  if not frame.empty: failures.append(frame)
+              except pd.errors.EmptyDataError:
+                  pass
+          failure_df = pd.concat(failures, ignore_index=True) if failures else pd.DataFrame(columns=['code','error_code','error_msg'])
+          failure_df.to_csv('incremental/query_failures.csv', index=False, encoding='utf-8-sig')
+          for name in ['trade_dates.csv','stock_basic_current.csv','new_security_master.csv']:
+              source = shard_dirs[0]/name
+              if source.exists():
+                  Path('incremental', name).write_bytes(source.read_bytes())
+          Path('incremental/incremental_meta.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          Path('output/incremental_meta.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          for name in ['trade_dates.csv','stock_basic_current.csv','new_security_master.csv','query_failures.csv']:
+              source = Path('incremental', name)
+              if source.exists(): Path('output', name).write_bytes(source.read_bytes())
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
       - name: Build verified combined database
         run: |
           set -euxo pipefail
