@@ -1,0 +1,192 @@
+name: A-share probability research through 2026-11-06
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DB_URL: https://github.com/noblechang/a-share-data/releases/download/FREE_DATA_v0/ashare_pit.duckdb
+  DB_SHA256: 95601e2f1f5b62595a80e735a52da3a64c7446ebe7f8c984e3394b96f90e4778
+  PYTHONUNBUFFERED: '1'
+  INCREMENTAL_START: '2026-09-25'
+  INCREMENTAL_END: '2026-11-06'
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install analysis and market-data dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install duckdb numpy pandas pyarrow baostock
+          python - <<'PY'
+          import baostock, duckdb
+          print('DuckDB', duckdb.__version__)
+          print('BaoStock package', getattr(baostock, '__version__', 'unknown'))
+          PY
+      - name: Reassemble and verify research program
+        run: |
+          set -euxo pipefail
+          : > research/run_a_share_research.py
+          for f in research/update20261106/run.part00.b64 research/update20261106/run.part01.b64 research/update20261106/run.part02.b64 research/update20261106/run.part03.b64; do
+            base64 -d "$f" >> research/run_a_share_research.py
+          done
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('research/run_a_share_research.py')
+          text = path.read_text(encoding='utf-8')
+          old_stream = 'con.execute(query).fetch_record_batch(rows_per_batch=200_000)'
+          new_stream = 'con.sql(query).to_arrow_reader(batch_size=200_000)'
+          old_view = '    con.execute(f"CREATE VIEW samples AS SELECT * FROM read_parquet(\'{sample_path.as_posix()}\')")'
+          new_view = "\n".join([
+              "    con.close()",
+              "    con = duckdb.connect()",
+              "    con.execute(\"PRAGMA threads=4\")",
+              "    con.execute(\"PRAGMA memory_limit='5GB'\")",
+              "    con.execute(f\"PRAGMA temp_directory='{WORK_DIR.as_posix()}/duckdb_tmp'\")",
+              "    con.execute(f\"CREATE VIEW samples AS SELECT * FROM read_parquet('{sample_path.as_posix()}')\")",
+          ])
+          for old, new in [(old_stream, new_stream), (old_view, new_view)]:
+              if old not in text:
+                  raise SystemExit(f'Expected code fragment not found: {old}')
+              text = text.replace(old, new)
+          path.write_text(text, encoding='utf-8')
+          PY
+          python -m py_compile research/run_a_share_research.py
+          python -m py_compile research/fetch_baostock_incremental.py
+          sha256sum research/run_a_share_research.py research/fetch_baostock_incremental.py
+      - name: Download and verify baseline all-market database
+        run: |
+          set -euxo pipefail
+          curl -L --fail --retry 8 --retry-delay 10 --continue-at - "$DB_URL" -o ashare_pit.duckdb
+          echo "$DB_SHA256  ashare_pit.duckdb" | sha256sum -c -
+          ls -lh ashare_pit.duckdb
+          free -h
+          df -h .
+      - name: Fetch BaoStock increment through 2026-11-06
+        run: |
+          set -o pipefail
+          mkdir -p incremental output work/duckdb_tmp
+          python research/fetch_baostock_incremental.py 2>&1 | tee incremental/fetch.log
+          status=${PIPESTATUS[0]}
+          cp incremental/incremental_meta.json output/ 2>/dev/null || true
+          cp incremental/trade_dates.csv output/ 2>/dev/null || true
+          cp incremental/stock_basic_current.csv output/ 2>/dev/null || true
+          cp incremental/new_security_master.csv output/ 2>/dev/null || true
+          cp incremental/query_failures.csv output/ 2>/dev/null || true
+          cp incremental/fetch.log output/incremental_fetch.log
+          exit $status
+      - name: Build verified combined database
+        run: |
+          set -euxo pipefail
+          cp ashare_pit.duckdb ashare_full_20261106.duckdb
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import duckdb
+          import pandas as pd
+
+          db = 'ashare_full_20261106.duckdb'
+          con = duckdb.connect(db)
+          baseline_max = con.execute('SELECT MAX(trade_date) FROM bars').fetchone()[0]
+          before_rows = con.execute('SELECT COUNT(*) FROM bars').fetchone()[0]
+          con.execute("""
+              INSERT INTO bars
+              SELECT security_id, trade_date, open, high, low, close, preclose,
+                     volume, amount, adjustflag, turn, tradestatus, pctChg, isST
+              FROM read_parquet('incremental/incremental_bars.parquet')
+              WHERE trade_date > ?
+          """, [baseline_max])
+
+          current = pd.read_csv('incremental/stock_basic_current.csv', dtype=str).fillna('')
+          current = current[current['type'] == '1'].copy()
+          current['exchange'] = current['code'].str[:2].map({'sh': 'SSE', 'sz': 'SZSE'})
+          current['symbol'] = current['code'].str[3:]
+          current = current[
+              ((current['exchange'] == 'SSE') & current['symbol'].str.startswith(('600','601','603','605','688','689')))
+              | ((current['exchange'] == 'SZSE') & current['symbol'].str.startswith(('000','001','002','003','300','301')))
+          ].copy()
+          current['security_id'] = 'CN:' + current['exchange'] + ':' + current['symbol']
+          con.register('current_basic_df', current)
+          con.execute("""
+              UPDATE security_master AS sm
+              SET name = cb.code_name,
+                  list_date = TRY_CAST(NULLIF(cb.ipoDate, '') AS DATE),
+                  delist_date = TRY_CAST(NULLIF(cb.outDate, '') AS DATE),
+                  status = TRY_CAST(cb.status AS BIGINT)
+              FROM current_basic_df AS cb
+              WHERE sm.security_id = cb.security_id
+          """)
+          con.execute("""
+              INSERT INTO security_master
+              SELECT cb.security_id, cb.exchange, cb.symbol, cb.code,
+                     cb.code_name,
+                     TRY_CAST(NULLIF(cb.ipoDate, '') AS DATE),
+                     TRY_CAST(NULLIF(cb.outDate, '') AS DATE),
+                     TRY_CAST(cb.status AS BIGINT)
+              FROM current_basic_df cb
+              LEFT JOIN security_master sm USING (security_id)
+              WHERE sm.security_id IS NULL
+          """)
+
+          after_rows = con.execute('SELECT COUNT(*) FROM bars').fetchone()[0]
+          latest = con.execute('SELECT MAX(trade_date) FROM bars').fetchone()[0]
+          latest_count = con.execute("SELECT COUNT(DISTINCT security_id) FROM bars WHERE trade_date=DATE '2026-11-06' AND tradestatus=1 AND volume>0").fetchone()[0]
+          duplicates = con.execute("""
+              SELECT COUNT(*) FROM (
+                  SELECT security_id, trade_date, COUNT(*) AS n
+                  FROM bars
+                  GROUP BY 1,2
+                  HAVING COUNT(*) > 1
+              )
+          """).fetchone()[0]
+          validation = {
+              'baseline_max_date': str(baseline_max),
+              'combined_max_date': str(latest),
+              'baseline_rows': int(before_rows),
+              'combined_rows': int(after_rows),
+              'appended_rows': int(after_rows - before_rows),
+              'traded_securities_on_2026_11_06': int(latest_count),
+              'duplicate_security_date_keys': int(duplicates),
+              'security_master_rows': int(con.execute('SELECT COUNT(*) FROM security_master').fetchone()[0]),
+          }
+          Path('output/combined_database_validation.json').write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(validation, ensure_ascii=False, indent=2))
+          if str(latest) != '2026-11-06':
+              raise SystemExit(f'Combined database is stale: {latest}')
+          if latest_count < 5000:
+              raise SystemExit(f'Low 2026-11-06 market coverage: {latest_count}')
+          if duplicates != 0:
+              raise SystemExit(f'Duplicate security/date keys found: {duplicates}')
+          con.close()
+          PY
+          sha256sum ashare_full_20261106.duckdb > output/combined_database_sha256.txt
+      - name: Run full 2016-2026 eight-indicator research
+        env:
+          DB_PATH: ashare_full_20261106.duckdb
+          OUT_DIR: output
+          WORK_DIR: work
+        run: |
+          set -o pipefail
+          python research/run_a_share_research.py 2>&1 | tee output/run.log
+          status=${PIPESTATUS[0]}
+          find output -maxdepth 1 -type f -printf '%f %s bytes\n' | sort | tee -a output/run.log
+          exit $status
+      - name: Upload updated research outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a-share-probability-research-20261106
+          path: output/
+          if-no-files-found: warn
+          retention-days: 7
